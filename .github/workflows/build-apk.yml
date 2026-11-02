@@ -1,1 +1,249 @@
 
+name: Build Android Debug APK
+
+# Starts automatically when this workflow file or the project ZIP is pushed,
+# and can also be started by hand: Actions -> "Build Android Debug APK" -> Run workflow.
+on:
+  push:
+    paths:
+      - "NOVA-ANDROID-GITHUB-FIXED.zip"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+    inputs:
+      vosk_model_sha256:
+        description: "Optional: SHA-256 of vosk-model-small-en-us-0.15.zip to pin (leave empty to just print it in the log)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash   # bash with -eo pipefail
+
+env:
+  ZIP_NAME: NOVA-ANDROID-GITHUB-FIXED.zip
+  EXTRACT_DIR: nova-extracted
+
+jobs:
+  build:
+    name: Build Android Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository (contains the project ZIP)
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          zip="$ZIP_NAME"
+          if [ ! -f "$zip" ]; then
+            echo "::warning::$ZIP_NAME not found in the repository root; looking for a single other .zip there."
+            mapfile -t zips < <(find . -maxdepth 1 -type f -name '*.zip' -printf '%f\n')
+            if [ "${#zips[@]}" -eq 1 ]; then
+              zip="${zips[0]}"
+              echo "Using $zip"
+            else
+              echo "::error::Expected $ZIP_NAME (or exactly one .zip) in the repository root. Found ${#zips[@]} .zip file(s)."
+              ls -la
+              exit 1
+            fi
+          fi
+          ls -l "$zip"
+          unzip -tq "$zip"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$zip" -d "$EXTRACT_DIR"
+          echo "Extracted $(find "$EXTRACT_DIR" -type f | wc -l) files into $EXTRACT_DIR/"
+
+      # Android project = a directory with settings.gradle.kts, app/build.gradle.kts and gradlew.
+      - name: Locate Android Gradle project
+        id: locate
+        run: |
+          mapfile -t found < <(
+            find "$EXTRACT_DIR" -maxdepth 4 -name settings.gradle.kts -not -path '*/node_modules/*' -printf '%h\n' | sort |
+            while read -r d; do
+              if [ -f "$d/app/build.gradle.kts" ] && [ -f "$d/gradlew" ]; then echo "$d"; fi
+            done
+          )
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Android Gradle project, found ${#found[@]}:"
+            printf '  %s\n' "${found[@]}"
+            find "$EXTRACT_DIR" -maxdepth 3 -type d | head -50
+            exit 1
+          fi
+          dir="${found[0]}"
+          echo "Gradle project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "NOVA_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Check required project files
+        run: |
+          cd "$NOVA_DIR"
+          missing=0
+          for f in settings.gradle.kts build.gradle.kts gradle.properties gradle/libs.versions.toml \
+                   gradlew gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.properties \
+                   app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ -s "$f" ]; then echo "ok       $f"; else echo "::error::missing or empty: $NOVA_DIR/$f"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "--- gradle-wrapper.properties"
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      - name: Check Gradle wrapper jar
+        run: |
+          cd "$NOVA_DIR"
+          actual="$(sha256sum gradle/wrapper/gradle-wrapper.jar | awk '{print $1}')"
+          # Official Gradle 8.10.2 wrapper jar checksum (https://gradle.org/release-checksums/)
+          official="2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
+          echo "gradle-wrapper.jar sha256: $actual"
+          if [ "$actual" != "$official" ]; then
+            echo "::warning::gradle-wrapper.jar differs from the official Gradle 8.10.2 wrapper jar checksum."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK (platform 35, build-tools 35.0.0)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+
+      - name: Accept Android SDK licences
+        run: |
+          set +o pipefail
+          SDKMANAGER="$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          test -s "$ANDROID_HOME/licenses/android-sdk-license"
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+          echo "Android SDK licences accepted; platform 35 and build-tools 35.0.0 present."
+
+      - name: Set up Gradle (dependency cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: ${{ steps.locate.outputs.dir }}
+
+      - name: Prepare Gradle wrapper and optional model checksum pin
+        env:
+          VOSK_SHA: ${{ inputs.vosk_model_sha256 }}
+        run: |
+          chmod +x "$NOVA_DIR/gradlew"
+          mkdir -p "$GITHUB_WORKSPACE/ci-logs"
+          if [ -n "$VOSK_SHA" ]; then
+            if ! [[ "$VOSK_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "::error::vosk_model_sha256 must be exactly 64 hex characters."
+              exit 1
+            fi
+            echo "VOSK_PIN=-PvoskModelSha256=$VOSK_SHA" >> "$GITHUB_ENV"
+            echo "Pinning Vosk model zip SHA-256 to $VOSK_SHA"
+          else
+            echo "VOSK_PIN=" >> "$GITHUB_ENV"
+            echo "No SHA-256 pin given; the actual hash will be printed by the fetchVoskModel task."
+          fi
+          cd "$NOVA_DIR"
+          ./gradlew --version --console=plain
+
+      # Custom task from app/build.gradle.kts (downloads vosk-model-small-en-us-0.15.zip).
+      - name: Download Vosk wake-word model (:app:fetchVoskModel)
+        run: |
+          cd "$NOVA_DIR"
+          ./gradlew :app:fetchVoskModel --stacktrace --console=plain $VOSK_PIN 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/01-fetchVoskModel.log"
+
+      # Same file list the app itself validates at runtime (WakeWordModelStore.REQUIRED_FILES).
+      - name: Verify Vosk model files
+        run: |
+          cd "$NOVA_DIR"
+          if [ -f app/src/main/assets/model-en-us/am/final.mdl ]; then
+            model="app/src/main/assets/model-en-us"
+          else
+            model="app/build/generated/voskModel/model-en-us"
+          fi
+          echo "Model directory: $NOVA_DIR/$model"
+          bad=0
+          for f in am/final.mdl conf/mfcc.conf graph/HCLr.fst graph/Gr.fst graph/words.txt; do
+            if [ -s "$model/$f" ]; then echo "ok       $f"; else echo "::error::Vosk model file missing or empty: $f"; bad=1; fi
+          done
+          for w in hey nova; do
+            if grep -q "^$w " "$model/graph/words.txt"; then echo "ok       vocabulary contains '$w'"; else echo "::error::'$w' not in graph/words.txt"; bad=1; fi
+          done
+          [ "$bad" -eq 0 ]
+
+      - name: Run unit tests (:app:testDebugUnitTest)
+        run: |
+          cd "$NOVA_DIR"
+          ./gradlew :app:testDebugUnitTest --stacktrace --console=plain $VOSK_PIN 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/02-testDebugUnitTest.log"
+
+      - name: Build debug APK (:app:assembleDebug)
+        run: |
+          cd "$NOVA_DIR"
+          ./gradlew :app:assembleDebug --stacktrace --console=plain $VOSK_PIN 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/03-assembleDebug.log"
+
+      - name: Verify APK
+        id: apk
+        run: |
+          apk="$(realpath "$NOVA_DIR/app/build/outputs/apk/debug/app-debug.apk")"
+          if [ ! -f "$apk" ]; then
+            echo "::error::APK not found at $NOVA_DIR/app/build/outputs/apk/debug/app-debug.apk"
+            find "$NOVA_DIR/app/build/outputs" -type f 2>/dev/null || true
+            exit 1
+          fi
+          if [ ! -s "$apk" ]; then
+            echo "::error::APK exists but is empty: $apk"
+            exit 1
+          fi
+          unzip -tq "$apk"
+          if ! unzip -l "$apk" | grep -q "assets/model-en-us/am/final.mdl"; then
+            echo "::error::APK does not contain assets/model-en-us/am/final.mdl (Vosk model not bundled)."
+            exit 1
+          fi
+          if ! unzip -l "$apk" | grep -q "libjnidispatch.so"; then
+            echo "::error::APK does not contain libjnidispatch.so (JNA native library missing)."
+            exit 1
+          fi
+          if ! unzip -l "$apk" | grep -q "libvosk.so"; then
+            echo "::error::APK does not contain libvosk.so (Vosk native library missing)."
+            exit 1
+          fi
+          size="$(stat -c %s "$apk")"
+          sha="$(sha256sum "$apk" | awk '{print $1}')"
+          echo "APK: $apk"
+          echo "Size: $size bytes"
+          echo "SHA-256: $sha"
+          unzip -l "$apk" | grep -E "\.so$" || true
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk" || echo "::warning::apksigner could not verify the APK signature."
+          {
+            echo "### NOVA debug APK"
+            echo "- File: \`app-debug.apk\` ($size bytes)"
+            echo "- SHA-256: \`$sha\`"
+            echo "- Download: Artifacts section below, artifact **nova-assistant-debug-apk**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-assistant-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-build-logs
+          path: |
+            ci-logs/
+            ${{ steps.locate.outputs.dir }}/app/build/reports/
+            ${{ steps.locate.outputs.dir }}/app/build/test-results/
+            ${{ steps.locate.outputs.dir }}/app/build/outputs/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+          
